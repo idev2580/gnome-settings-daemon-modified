@@ -67,6 +67,9 @@
 #include "gvc-mixer-control.h"
 #include "gvc-mixer-sink.h"
 
+#include <libgnome-desktop/gnome-rr.h>
+#include <libgnome-desktop/gnome-idle-monitor.h>
+
 #define GSD_DBUS_PATH "/org/gnome/SettingsDaemon"
 #define GSD_DBUS_NAME "org.gnome.SettingsDaemon"
 #define GSD_DBUS_BASE_INTERFACE "org.gnome.SettingsDaemon"
@@ -222,6 +225,13 @@ typedef struct
 
         /* Multimedia keys */
         MprisController *mpris_controller;
+
+        /* Ambient */
+        GDBusProxy              *iio_proxy;
+        guint                    iio_proxy_watch_id;
+
+        /* Screen */
+        GnomeRRScreen           *rr_screen;
 } GsdMediaKeysManagerPrivate;
 
 static void     gsd_media_keys_manager_class_init  (GsdMediaKeysManagerClass *klass);
@@ -240,6 +250,192 @@ static void     keys_sync_continue                 (GsdMediaKeysManager *manager
 G_DEFINE_TYPE_WITH_PRIVATE (GsdMediaKeysManager, gsd_media_keys_manager, G_TYPE_OBJECT)
 
 static gpointer manager_object = NULL;
+
+static void
+on_rr_screen_acquired (GObject      *object,
+                       GAsyncResult *result,
+                       gpointer      user_data)
+{
+        GsdMediaKeysManagerPrivate *priv = GSD_MEDIA_KEYS_MANAGER_GET_PRIVATE(user_data);
+        GError *error = NULL;
+
+        gnome_settings_profile_start (NULL);
+
+        priv->rr_screen = gnome_rr_screen_new_finish (result, &error);
+
+        if (error) {
+                g_warning ("Could not create GnomeRRScreen: %s\n", error->message);
+                g_error_free (error);
+                gnome_settings_profile_end (NULL);
+                return;
+        }
+        gnome_settings_profile_end (NULL);
+}
+static void
+iio_proxy_changed (GsdMediaKeysManagerPrivate *priv)
+{
+        //Nothing to do.
+}
+static void
+light_claimed_cb (GObject      *source_object,
+                  GAsyncResult *res,
+                  gpointer      user_data)
+{
+        GsdMediaKeysManagerPrivate *priv = user_data;
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GVariant) result = NULL;
+
+        result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object),
+                                           res,
+                                           &error);
+        if (result == NULL) {
+                g_warning ("Claiming light sensor failed: %s", error->message);
+                return;
+        }
+        iio_proxy_changed (priv);
+}
+
+
+static void
+light_released_cb (GObject      *source_object,
+                   GAsyncResult *res,
+                   gpointer      user_data)
+{
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GVariant) result = NULL;
+
+        result = g_dbus_proxy_call_finish (G_DBUS_PROXY (source_object),
+                                           res,
+                                           &error);
+        if (result == NULL) {
+                g_warning ("Release of light sensors failed: %s", error->message);
+                return;
+        }
+}
+static void
+iio_proxy_changed_cb (GDBusProxy *proxy,
+                      GVariant   *changed_properties,
+                      GStrv       invalidated_properties,
+                      gpointer    user_data)
+{
+        iio_proxy_changed ((GsdMediaKeysManagerPrivate *) user_data);
+}
+static void
+iio_proxy_claim_light (GsdMediaKeysManagerPrivate *priv, gboolean active)
+{
+        if (priv->iio_proxy == NULL)
+                return;
+	/*if (active && !manager->session_is_active)
+		return;*/
+
+        /* FIXME:
+         * Remove when iio-sensor-proxy sends events only to clients instead
+         * of all listeners:
+         * https://github.com/hadess/iio-sensor-proxy/issues/210 */
+
+        /* disconnect, otherwise callback can be added multiple times */
+        g_signal_handlers_disconnect_by_func (priv->iio_proxy,
+                                              G_CALLBACK (iio_proxy_changed_cb),
+                                              priv);
+
+        if (active)
+                g_signal_connect (priv->iio_proxy, "g-properties-changed",
+                                  G_CALLBACK (iio_proxy_changed_cb), priv);
+
+        g_dbus_proxy_call (priv->iio_proxy,
+                           active ? "ClaimLight" : "ReleaseLight",
+                           NULL,
+                           G_DBUS_CALL_FLAGS_NONE,
+                           -1,
+                           priv->bus_cancellable,
+                           active ? light_claimed_cb : light_released_cb,
+                           priv);
+}
+static void
+iio_proxy_appeared_cb (GDBusConnection *connection,
+                       const gchar *name,
+                       const gchar *name_owner,
+                       gpointer user_data)
+{
+        GsdMediaKeysManagerPrivate *priv = GSD_MEDIA_KEYS_MANAGER_GET_PRIVATE (user_data);
+        priv->iio_proxy =
+                g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
+                                               0,
+                                               NULL,
+                                               "net.hadess.SensorProxy",
+                                               "/net/hadess/SensorProxy",
+                                               "net.hadess.SensorProxy",
+                                               NULL,
+                                               NULL);
+        iio_proxy_claim_light (priv, TRUE);
+}
+
+static void
+iio_proxy_vanished_cb (GDBusConnection *connection,
+                       const gchar *name,
+                       gpointer user_data)
+{
+        GsdMediaKeysManagerPrivate *priv = GSD_MEDIA_KEYS_MANAGER_GET_PRIVATE (user_data);
+        g_clear_object (&priv->iio_proxy);
+}
+
+static void
+backlight_disable (GsdMediaKeysManagerPrivate *priv)
+{
+        gboolean ret;
+        GError *error = NULL;
+
+        iio_proxy_claim_light (priv, FALSE);
+        ret = gnome_rr_screen_set_dpms_mode (priv->rr_screen,
+                                             GNOME_RR_DPMS_OFF,
+                                             &error);
+        if (!ret) {
+                g_warning ("failed to turn the panel off: %s",
+                           error->message);
+                g_error_free (error);
+        }
+        g_debug ("TESTSUITE: Blanked screen");
+}
+static void
+backlight_enable (GsdMediaKeysManagerPrivate *priv)
+{
+        gboolean ret;
+        GError *error = NULL;
+
+        iio_proxy_claim_light (priv, TRUE);
+        ret = gnome_rr_screen_set_dpms_mode (priv->rr_screen,
+                                             GNOME_RR_DPMS_ON,
+                                             &error);
+        if (!ret) {
+                g_warning ("failed to turn the panel on: %s",
+                           error->message);
+                g_error_free (error);
+        }
+
+        g_debug ("TESTSUITE: Unblanked screen");
+}
+static void
+backlight_toggle(GsdMediaKeysManagerPrivate *priv){
+        GError* error = NULL;
+        GnomeRRDpmsMode mode;
+        gnome_rr_screen_get_dpms_mode(
+                priv->rr_screen,
+                &mode,
+                &error
+        );
+
+        if(error){
+                g_warning("failed to get panel status : %s", error->message);
+                g_error_free(error);
+                return;
+        }
+
+        if(mode == GNOME_RR_DPMS_ON){
+                backlight_disable(priv);
+        } else {
+                backlight_enable(priv);
+        }
+}
 
 static void
 media_key_unref (MediaKey *key)
@@ -1978,6 +2174,8 @@ do_config_power_action (GsdMediaKeysManager *manager,
         case GSD_POWER_ACTION_NOTHING:
                 /* these actions cannot be handled by media-keys and
                  * are not used in this context */
+                GsdMediaKeysManagerPrivate *priv = GSD_MEDIA_KEYS_MANAGER_GET_PRIVATE (manager);
+                backlight_toggle(priv);
                 break;
         }
 }
@@ -1991,7 +2189,6 @@ supports_power_action (GsdMediaKeysManager *manager,
         g_autoptr(GVariant) variant = NULL;
         const char *reply;
         gboolean result = FALSE;
-
         switch (action_type) {
         case GSD_POWER_ACTION_SUSPEND:
                 method_name = "CanSuspend";
@@ -2009,8 +2206,12 @@ supports_power_action (GsdMediaKeysManager *manager,
                 break;
         }
 
+        if(action_type == GSD_POWER_ACTION_BLANK)
+                return TRUE;
+
         if (method_name == NULL)
                 return FALSE;
+
 
         variant = g_dbus_proxy_call_sync (priv->logind_proxy,
                                           method_name,
@@ -2062,11 +2263,12 @@ do_config_power_button_action (GsdMediaKeysManager *manager,
         case GSD_POWER_BUTTON_ACTION_INTERACTIVE:
                 action = GSD_POWER_ACTION_INTERACTIVE;
                 break;
+        case GSD_POWER_BUTTON_ACTION_NOTHING:
+                action = GSD_POWER_ACTION_BLANK;
+                break;
         default:
                 g_warn_if_reached ();
-                G_GNUC_FALLTHROUGH;
-        case GSD_POWER_BUTTON_ACTION_NOTHING:
-                /* do nothing */
+                //G_GNUC_FALLTHROUGH;
                 return;
         }
 
@@ -3018,6 +3220,18 @@ gsd_media_keys_manager_start (GsdMediaKeysManager *manager,
 
         register_manager (manager_object);
 
+        /* coldplug the list of screens */
+        gnome_rr_screen_new_async (gdk_screen_get_default (),
+                                   on_rr_screen_acquired, manager);
+        
+        /* setup ambient light support */
+        priv->iio_proxy_watch_id =
+                g_bus_watch_name (G_BUS_TYPE_SYSTEM,
+                                  "net.hadess.SensorProxy",
+                                  G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                  iio_proxy_appeared_cb,
+                                  iio_proxy_vanished_cb,
+                                  manager, NULL);
         gnome_settings_profile_end (NULL);
 
         return TRUE;
@@ -3068,12 +3282,13 @@ gsd_media_keys_manager_stop (GsdMediaKeysManager *manager)
         }
 
         g_clear_pointer (&priv->ca, ca_context_destroy);
+        g_clear_object (&priv->iio_proxy);
 
 #if HAVE_GUDEV
         g_clear_pointer (&priv->streams, g_hash_table_destroy);
         g_clear_object (&priv->udev_client);
 #endif /* HAVE_GUDEV */
-
+        
         g_clear_object (&priv->logind_proxy);
         g_clear_object (&priv->settings);
         g_clear_object (&priv->sound_settings);
