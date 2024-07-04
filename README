@@ -1,3 +1,11 @@
+GNOME-Settings-Daemon-Modified
+===============================================================================
+A modified version of GNOME-Settings-Daemon.
+Original repository is below.
+ (https://gitlab.gnome.org/GNOME/gnome-settings-daemon)
+
+Worked on gnome-46 branch
+
 Introduction to GNOME Settings Daemon
 ===============================================================================
 
